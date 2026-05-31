@@ -14,6 +14,7 @@ import ctypes
 import ctypes.wintypes
 import base64
 import socket
+import random
 from pathlib import Path
 from typing import Optional
 from datetime import datetime
@@ -47,6 +48,25 @@ ICON_PATH = APP_DIR / "assets" / "claude-icon.ico"
 
 # 单实例检测：绑定本机回环端口，重复启动时唤醒已有窗口而不是再开一个进程
 SINGLETON_PORT = 49231
+
+# 5h 窗口预热用的 prompt 池（轻量、无害的日常问题，让请求看起来像真实用户）
+WARMUP_PROMPTS = [
+    "今天天气怎么样？",
+    "推荐一首歌",
+    "讲个冷笑话",
+    "1+1 等于几",
+    "你好",
+    "Python 是什么",
+    "推荐一本书",
+    "宋朝有多少年",
+    "今天周几",
+    "如何泡茶",
+    "番茄炒蛋怎么做",
+    "什么是机器学习",
+    "光速是多少",
+    "推荐一部电影",
+    "杭州有什么好玩的",
+]
 
 # 需要按 profile 交换的会话文件
 SESSION_FILES = [
@@ -221,6 +241,29 @@ class ProfileManager:
 
     def save_meta(self, meta: dict):
         PROFILES_META.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def get_warmup(self, name: str) -> dict:
+        """读取某个 profile 的预热配置；不存在时返回默认值"""
+        meta = self.get_meta()
+        warmup = meta.get(name, {}).get("warmup", {})
+        return {
+            "enabled": bool(warmup.get("enabled", False)),
+            "schedule": list(warmup.get("schedule", [])),  # ["05:00", ...]
+            "max_tokens": int(warmup.get("max_tokens", 10)),
+            "last_run_date": warmup.get("last_run_date", ""),
+        }
+
+    def save_warmup(self, name: str, warmup: dict):
+        """写入某个 profile 的预热配置"""
+        meta = self.get_meta()
+        entry = meta.setdefault(name, {})
+        entry["warmup"] = {
+            "enabled": bool(warmup.get("enabled", False)),
+            "schedule": list(warmup.get("schedule", [])),
+            "max_tokens": int(warmup.get("max_tokens", 10)),
+            "last_run_date": warmup.get("last_run_date", ""),
+        }
+        self.save_meta(meta)
 
     def save_session(self, name: str):
         dest = INSTANCE_DIR / name
@@ -483,22 +526,24 @@ class UsageFetcher:
         }
 
     @classmethod
-    def fetch_usage(cls, token: str) -> dict:
-        """通过 api.anthropic.com 获取用量数据
-        发送一个最小的请求（消耗 ~1 token），从响应头读 rate-limit 信息
+    def fetch_usage(cls, token: str, max_tokens: int = 1, prompt: str = "a") -> dict:
+        """通过 api.anthropic.com 获取用量数据 / 触发窗口预热
+
+        发送一个最小请求，从响应头读 rate-limit 信息。
+        max_tokens / prompt 用于自定义请求大小：
+          - 默认 max_tokens=1, prompt="a" 仅用于探活（消耗 ~1 token）
+          - 预热场景可以传 max_tokens=10~15 + 真实问题，行为更像真实用户
         返回字典：{
-            'session_pct': 26,             # 5小时窗口百分比
-            'session_reset_epoch': 1780225200,  # 5h 重置时间戳（绝对时间）
-            'weekly_pct': 2,               # 7天窗口百分比
+            'session_pct': 26,
+            'session_reset_epoch': 1780225200,
+            'weekly_pct': 2,
             'weekly_reset_epoch': 1780513200,
-            'fetched_at': 1780207000,      # 数据获取的时间戳
+            'fetched_at': 1780207000,
         }
         """
         result = {}
         if not token:
             return result
-
-        # 调 API（携带敏感 OAuth token，必须校验 TLS 证书）
 
         # 调 API（携带敏感 OAuth token，必须校验 TLS 证书）
         try:
@@ -514,8 +559,8 @@ class UsageFetcher:
                 },
                 json={
                     'model': 'claude-haiku-4-5',
-                    'max_tokens': 1,
-                    'messages': [{'role': 'user', 'content': 'a'}],
+                    'max_tokens': max_tokens,
+                    'messages': [{'role': 'user', 'content': prompt}],
                 },
                 timeout=15)
 
@@ -636,34 +681,44 @@ class ConfirmDialog(ctk.CTkToplevel):
 
 
 class EditNoteDialog(ctk.CTkToplevel):
-    """编辑备注弹窗，支持预填原有内容 + 复制按钮 + 删除按钮"""
+    """编辑备注 + 预热配置弹窗"""
 
     # 返回结果约定：
     #   None        — 取消
     #   "__delete__" — 删除此 profile
-    #   其他字符串    — 保存为新备注
+    #   dict 形式    — {"note": str, "warmup": dict}
 
-    def __init__(self, parent, name: str, current_note: str):
+    def __init__(self, parent, name: str, current_note: str,
+                 current_warmup: Optional[dict] = None,
+                 on_test_warmup=None):
         super().__init__(parent)
         self.result = None
         self.title(f"编辑 - {name}")
-        self.geometry("440x250")
+        self.geometry("480x520")
         self.resizable(False, False)
         self.transient(parent)
         self.grab_set()
         self.configure(fg_color=COLORS["bg_main"])
+        self._on_test_warmup = on_test_warmup
+        self._profile_name = name
+
+        # 当前预热配置（深拷贝，避免直接改外部 dict）
+        warmup = current_warmup or {}
+        self._warmup_enabled = ctk.BooleanVar(value=bool(warmup.get("enabled")))
+        self._warmup_max_tokens = ctk.StringVar(value=str(warmup.get("max_tokens", 10)))
+        self._schedule_list = list(warmup.get("schedule", []))
 
         self.update_idletasks()
-        x = parent.winfo_x() + (parent.winfo_width() - 440) // 2
-        y = parent.winfo_y() + (parent.winfo_height() - 250) // 2
+        x = parent.winfo_x() + (parent.winfo_width() - 480) // 2
+        y = parent.winfo_y() + (parent.winfo_height() - 520) // 2
         self.geometry(f"+{x}+{y}")
 
-        ctk.CTkLabel(self, text=f"「{name}」的备注（如邮箱/密码/令牌等）：",
-                     font=("Microsoft YaHei UI", 12),
-                     text_color=COLORS["text_primary"]).pack(pady=(20, 10), padx=20)
+        # ==== 备注区 ====
+        ctk.CTkLabel(self, text=f"「{name}」的备注（如邮箱/账号识别等，不要存密码）",
+                     font=("Microsoft YaHei UI", 11),
+                     text_color=COLORS["text_secondary"]).pack(pady=(20, 8), padx=20, anchor="w")
 
-        # 输入框，预填原有备注
-        self.entry = ctk.CTkEntry(self, width=400, height=36,
+        self.entry = ctk.CTkEntry(self, width=440, height=36,
                                    font=("Microsoft YaHei UI", 12),
                                    fg_color=COLORS["bg_card"],
                                    border_color=COLORS["border_default"])
@@ -672,11 +727,98 @@ class EditNoteDialog(ctk.CTkToplevel):
             self.entry.insert(0, current_note)
             self.entry.select_range(0, "end")
 
-        # 按钮区分两组：左侧危险操作（删除），右侧主要操作
-        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
-        btn_frame.pack(fill="x", padx=20, pady=18)
+        # ==== 分割线 ====
+        ctk.CTkFrame(self, height=1, fg_color=COLORS["divider"]).pack(
+            fill="x", padx=20, pady=(18, 8))
 
-        # 左侧：删除按钮
+        # ==== 预热配置区 ====
+        warmup_header = ctk.CTkFrame(self, fg_color="transparent")
+        warmup_header.pack(fill="x", padx=20, pady=(2, 6))
+
+        ctk.CTkLabel(warmup_header, text="5h 窗口预热",
+                     font=("Microsoft YaHei UI", 13, "bold"),
+                     text_color=COLORS["text_primary"]).pack(side="left")
+
+        # 启用开关
+        ctk.CTkSwitch(warmup_header, text="启用",
+                       variable=self._warmup_enabled,
+                       font=("Microsoft YaHei UI", 11),
+                       progress_color=COLORS["accent"],
+                       text_color=COLORS["text_secondary"]).pack(side="right")
+
+        ctk.CTkLabel(self,
+                     text="到点自动发一条小请求激活 5h 窗口，让窗口结束时间对齐工作时段。",
+                     font=("Microsoft YaHei UI", 10),
+                     text_color=COLORS["text_tertiary"],
+                     wraplength=440, justify="left").pack(padx=20, pady=(0, 8), anchor="w")
+
+        # 时间列表
+        time_row = ctk.CTkFrame(self, fg_color="transparent")
+        time_row.pack(fill="x", padx=20, pady=(4, 4))
+        ctk.CTkLabel(time_row, text="触发时间：",
+                     font=("Microsoft YaHei UI", 11),
+                     text_color=COLORS["text_secondary"], width=80, anchor="w").pack(side="left")
+
+        self._time_chips_frame = ctk.CTkFrame(time_row, fg_color="transparent")
+        self._time_chips_frame.pack(side="left", fill="x", expand=True)
+        self._render_time_chips()
+
+        # 添加时间输入
+        add_row = ctk.CTkFrame(self, fg_color="transparent")
+        add_row.pack(fill="x", padx=20, pady=(2, 4))
+        ctk.CTkLabel(add_row, text="", width=80).pack(side="left")
+        self._new_time_entry = ctk.CTkEntry(add_row, width=80, height=28,
+                                              placeholder_text="HH:MM",
+                                              font=("Microsoft YaHei UI", 11),
+                                              fg_color=COLORS["bg_card"],
+                                              border_color=COLORS["border_default"])
+        self._new_time_entry.pack(side="left", padx=(0, 6))
+        ctk.CTkButton(add_row, text="+ 添加", width=70, height=28,
+                      font=("Microsoft YaHei UI", 11),
+                      fg_color=COLORS["accent_soft"],
+                      hover_color="#F5DDD2",
+                      text_color=COLORS["accent_hover"],
+                      command=self._add_time).pack(side="left")
+
+        # max_tokens 配置
+        token_row = ctk.CTkFrame(self, fg_color="transparent")
+        token_row.pack(fill="x", padx=20, pady=(8, 4))
+        ctk.CTkLabel(token_row, text="单次消耗：",
+                     font=("Microsoft YaHei UI", 11),
+                     text_color=COLORS["text_secondary"], width=80, anchor="w").pack(side="left")
+        ctk.CTkEntry(token_row, textvariable=self._warmup_max_tokens, width=60, height=28,
+                      font=("Microsoft YaHei UI", 11),
+                      fg_color=COLORS["bg_card"],
+                      border_color=COLORS["border_default"]).pack(side="left")
+        ctk.CTkLabel(token_row, text="tokens（建议 5-15，会随机 ±3）",
+                     font=("Microsoft YaHei UI", 10),
+                     text_color=COLORS["text_tertiary"]).pack(side="left", padx=(8, 0))
+
+        # 立即测试按钮
+        test_row = ctk.CTkFrame(self, fg_color="transparent")
+        test_row.pack(fill="x", padx=20, pady=(6, 4))
+        ctk.CTkLabel(test_row, text="", width=80).pack(side="left")
+        ctk.CTkButton(test_row, text="立即测试一次", width=130, height=28,
+                      font=("Microsoft YaHei UI", 11),
+                      fg_color=COLORS["bg_card"],
+                      hover_color=COLORS["track"],
+                      text_color=COLORS["text_secondary"],
+                      border_width=1,
+                      border_color=COLORS["border_default"],
+                      command=self._test_now).pack(side="left")
+        last_run = warmup.get("last_run_date", "")
+        if last_run:
+            ctk.CTkLabel(test_row, text=f"上次：{last_run}",
+                         font=("Microsoft YaHei UI", 10),
+                         text_color=COLORS["text_tertiary"]).pack(side="left", padx=(10, 0))
+
+        # ==== 底部按钮 ====
+        ctk.CTkFrame(self, height=1, fg_color=COLORS["divider"]).pack(
+            fill="x", padx=20, pady=(14, 0))
+
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(fill="x", padx=20, pady=14)
+
         ctk.CTkButton(btn_frame, text="删除 Profile", width=100, height=32,
                       font=("Microsoft YaHei UI", 12),
                       fg_color=COLORS["bg_card"],
@@ -686,7 +828,6 @@ class EditNoteDialog(ctk.CTkToplevel):
                       border_color=COLORS["border_default"],
                       command=self._delete).pack(side="left")
 
-        # 右侧：复制 + 取消 + 保存
         right_group = ctk.CTkFrame(btn_frame, fg_color="transparent")
         right_group.pack(side="right")
 
@@ -711,7 +852,7 @@ class EditNoteDialog(ctk.CTkToplevel):
                       text_color="#FFFFFF",
                       command=self._save).pack(side="left", padx=4)
 
-        # 复制/操作提示
+        # 操作提示
         self.copy_hint = ctk.CTkLabel(self, text="", font=("Microsoft YaHei UI", 11),
                                        text_color=COLORS["green"])
         self.copy_hint.pack()
@@ -721,31 +862,114 @@ class EditNoteDialog(ctk.CTkToplevel):
         self.bind("<Escape>", lambda e: self._cancel())
         self.protocol("WM_DELETE_WINDOW", self._cancel)
 
+    def _render_time_chips(self):
+        """渲染当前 schedule 的时间标签（药丸样式 + 删除按钮）"""
+        for w in self._time_chips_frame.winfo_children():
+            w.destroy()
+        if not self._schedule_list:
+            ctk.CTkLabel(self._time_chips_frame, text="（未设置）",
+                         font=("Microsoft YaHei UI", 11),
+                         text_color=COLORS["text_tertiary"]).pack(side="left")
+            return
+        for hm in sorted(self._schedule_list):
+            chip = ctk.CTkFrame(self._time_chips_frame, fg_color=COLORS["accent_soft"],
+                                 corner_radius=10)
+            chip.pack(side="left", padx=(0, 6), pady=2)
+            ctk.CTkLabel(chip, text=hm,
+                         font=("Microsoft YaHei UI", 11, "bold"),
+                         text_color=COLORS["accent_hover"]).pack(side="left", padx=(8, 4), pady=2)
+            ctk.CTkButton(chip, text="✕", width=18, height=18,
+                          font=("Segoe UI", 10),
+                          fg_color="transparent",
+                          hover_color="#F5DDD2",
+                          text_color=COLORS["accent_hover"],
+                          corner_radius=9,
+                          command=lambda t=hm: self._remove_time(t)).pack(side="left", padx=(0, 4))
+
+    def _add_time(self):
+        text = self._new_time_entry.get().strip()
+        if not self._is_valid_hm(text):
+            self.copy_hint.configure(text="时间格式必须是 HH:MM",
+                                      text_color=COLORS["red"])
+            self.after(2000, lambda: self.copy_hint.configure(text=""))
+            return
+        if text in self._schedule_list:
+            self.copy_hint.configure(text="该时间已存在", text_color=COLORS["red"])
+            self.after(2000, lambda: self.copy_hint.configure(text=""))
+            return
+        self._schedule_list.append(text)
+        self._new_time_entry.delete(0, "end")
+        self._render_time_chips()
+
+    def _remove_time(self, hm: str):
+        if hm in self._schedule_list:
+            self._schedule_list.remove(hm)
+            self._render_time_chips()
+
+    @staticmethod
+    def _is_valid_hm(text: str) -> bool:
+        try:
+            parts = text.split(":")
+            if len(parts) != 2:
+                return False
+            h, m = int(parts[0]), int(parts[1])
+            return 0 <= h <= 23 and 0 <= m <= 59
+        except (ValueError, AttributeError):
+            return False
+
+    def _test_now(self):
+        """立即测试一次预热（异步，不阻塞 UI）"""
+        if not self._on_test_warmup:
+            return
+        try:
+            max_tokens = max(5, int(self._warmup_max_tokens.get()))
+        except ValueError:
+            max_tokens = 10
+        self.copy_hint.configure(text="正在发送测试请求...",
+                                  text_color=COLORS["text_secondary"])
+        self._on_test_warmup(self._profile_name, max_tokens, self._on_test_result)
+
+    def _on_test_result(self, ok: bool, msg: str):
+        self.copy_hint.configure(
+            text=("✓ " if ok else "✗ ") + msg,
+            text_color=COLORS["green"] if ok else COLORS["red"])
+        self.after(4000, lambda: self.copy_hint.configure(text=""))
+
     def _copy(self):
         text = self.entry.get().strip()
         if text:
             self.clipboard_clear()
             self.clipboard_append(text)
-            self.copy_hint.configure(text="已复制到剪贴板")
+            self.copy_hint.configure(text="已复制到剪贴板", text_color=COLORS["green"])
             self.after(2000, lambda: self.copy_hint.configure(text=""))
         else:
-            self.copy_hint.configure(text="备注为空，无法复制")
+            self.copy_hint.configure(text="备注为空，无法复制", text_color=COLORS["red"])
             self.after(2000, lambda: self.copy_hint.configure(text=""))
 
     def _delete(self):
-        """删除按钮：返回特殊标记由调用方处理（包括二次确认）"""
         self.result = "__delete__"
         self.destroy()
 
     def _save(self):
-        self.result = self.entry.get()
+        try:
+            mt = max(5, int(self._warmup_max_tokens.get()))
+        except ValueError:
+            mt = 10
+        self.result = {
+            "note": self.entry.get(),
+            "warmup": {
+                "enabled": bool(self._warmup_enabled.get()),
+                "schedule": list(self._schedule_list),
+                "max_tokens": mt,
+            }
+        }
         self.destroy()
 
     def _cancel(self):
         self.result = None
         self.destroy()
 
-    def get_result(self) -> Optional[str]:
+    def get_result(self):
         self.wait_window()
         return self.result
 
@@ -1012,6 +1236,126 @@ class ProfileCard(ctk.CTkFrame):
             except Exception:
                 pass
 
+# === 预热调度器 ===
+
+class WarmupScheduler(threading.Thread):
+    """5h 窗口预热调度器：常驻后台线程，按 profile 配置的时间触发 1-2 token 请求
+
+    设计要点：
+      - 每 60s tick 一次，扫描所有启用预热的 profile
+      - 当前时间 in profile.schedule 且当日未运行 → 触发
+      - ±90s 抖动，避免准点（更像真实用户）
+      - 单 profile 单日最多触发一次（无论 schedule 配几个时间）
+      - max_tokens 在配置基础上随机 ±3，prompt 从池子里随机选
+      - 任何错误都吞掉不让线程崩溃
+    """
+
+    def __init__(self, pm, on_status=None):
+        super().__init__(daemon=True, name="WarmupScheduler")
+        self.pm = pm
+        self.on_status = on_status  # callable(profile_name, status_str)
+        self._stop_event = threading.Event()
+        self._jitter_until = {}  # {profile_name: epoch} — 抖动窗口的目标触发时间
+
+    def stop(self):
+        self._stop_event.set()
+
+    def run(self):
+        # 启动时不立刻跑，等 30s 让 UI 完全就绪
+        if self._stop_event.wait(30):
+            return
+        while not self._stop_event.is_set():
+            try:
+                self._tick()
+            except Exception as e:
+                # 任何异常都不能让调度线程死掉
+                pass
+            # 每 60s 检查一次
+            if self._stop_event.wait(60):
+                break
+
+    def _tick(self):
+        """扫描所有 profile，触发到期的预热"""
+        now = datetime.now()
+        today = now.strftime("%Y-%m-%d")
+        current_hm = now.strftime("%H:%M")
+
+        profiles = self.pm.get_profiles()
+        for name in profiles:
+            warmup = self.pm.get_warmup(name)
+            if not warmup.get("enabled"):
+                continue
+            schedule = warmup.get("schedule", [])
+            if not schedule:
+                continue
+            # 当日已经跑过 → 跳过
+            if warmup.get("last_run_date") == today:
+                continue
+
+            # 检查是否到达任何一个 schedule 时间（精度到分钟）
+            triggered = False
+            for hm in schedule:
+                if hm == current_hm:
+                    triggered = True
+                    break
+                # 检查是否在抖动窗口内（之前到点了但还没到抖动目标时间）
+                target = self._jitter_until.get((name, hm))
+                if target and time.time() >= target:
+                    triggered = True
+                    # 清掉抖动记录
+                    self._jitter_until.pop((name, hm), None)
+                    break
+
+            if triggered:
+                # 加 0~90s 随机抖动；如果还没到抖动时间，先记下来等下一个 tick
+                pending_target = self._jitter_until.get((name, hm))
+                if not pending_target:
+                    delay = random.randint(0, 90)
+                    self._jitter_until[(name, hm)] = time.time() + delay
+                    if delay > 0:
+                        continue  # 这次 tick 不发，下次 tick 时间到了再发
+                # 真正执行预热请求
+                self._do_warmup(name, warmup, today)
+
+    def _do_warmup(self, name: str, warmup: dict, today: str):
+        """实际发送预热请求"""
+        # 拿到 token：优先从 active 拿，否则从对应 profile config 拿
+        try:
+            current = self.pm.get_current()
+            if name == current:
+                ai = UsageFetcher.get_account_info()
+            else:
+                cfg = INSTANCE_DIR / name / "config.json"
+                if not cfg.exists():
+                    return
+                ai = UsageFetcher.get_account_info(cfg)
+            token = ai.get("token")
+            if not token:
+                return
+        except Exception:
+            return
+
+        # 随机化参数（让请求更像自然用户）
+        max_tokens = max(5, warmup.get("max_tokens", 10) + random.randint(-3, 3))
+        prompt = random.choice(WARMUP_PROMPTS)
+
+        try:
+            result = UsageFetcher.fetch_usage(token, max_tokens=max_tokens, prompt=prompt)
+            success = bool(result.get("ok"))
+            if self.on_status:
+                if success:
+                    self.on_status(name, f"预热成功（{datetime.now().strftime('%H:%M')}）")
+                else:
+                    self.on_status(name, f"预热失败：{result.get('error', '未知')}")
+        except Exception as e:
+            if self.on_status:
+                self.on_status(name, f"预热异常：{type(e).__name__}")
+
+        # 无论成功失败都更新 last_run_date，避免反复重试
+        warmup["last_run_date"] = today
+        self.pm.save_warmup(name, warmup)
+
+
 # === 主窗口 ===
 
 class App(ctk.CTk):
@@ -1054,6 +1398,9 @@ class App(ctk.CTk):
         self._setup_tray()
         self._start_singleton_listener()
         self._tick_countdown()
+        # 启动 5h 窗口预热调度器（守护线程，App 退出时自动结束）
+        self._warmup_scheduler = WarmupScheduler(self.pm, on_status=self._on_warmup_status)
+        self._warmup_scheduler.start()
         self.bind("<Configure>", self._on_resize)
         # UI 全部就绪后再启用 taskbar 显示并 deiconify 窗口
         self.after(1, self._enable_taskbar)
@@ -1167,6 +1514,14 @@ class App(ctk.CTk):
         except Exception:
             pass
         self.after(30000, self._tick_countdown)
+
+    def _on_warmup_status(self, profile_name: str, status: str):
+        """WarmupScheduler 回调：自动预热成功/失败时更新状态栏并刷新卡片"""
+        # 切回主线程显示
+        self.after(0, lambda: self.set_status(f"「{profile_name}」{status}"))
+        # 预热成功后刷新一次卡片，显示新的 5h 用量
+        if "成功" in status:
+            self.after(0, lambda: self._refresh_profiles(fetch_usage=False))
 
     def _load_usage_cache(self) -> dict:
         """从磁盘加载用量缓存（只保留还有效的）"""
@@ -1796,21 +2151,61 @@ class App(ctk.CTk):
         threading.Thread(target=do_create, daemon=True).start()
 
     def on_edit(self, name: str):
-        """编辑 profile 备注（带预填 + 复制 + 删除）"""
+        """编辑 profile：备注 + 预热配置 + 删除"""
         meta = self.pm.get_meta()
         current_note = meta.get(name, {}).get("note", "")
-        dialog = EditNoteDialog(self, name, current_note)
+        current_warmup = self.pm.get_warmup(name)
+        dialog = EditNoteDialog(self, name, current_note,
+                                 current_warmup=current_warmup,
+                                 on_test_warmup=self._test_warmup)
         result = dialog.get_result()
         if result is None:
             return
         if result == "__delete__":
-            # 用户在编辑弹窗里点了删除 → 走二次确认流程
             self.on_delete(name)
             return
-        meta.setdefault(name, {})["note"] = result.strip()
+        # result 是 dict: {"note": ..., "warmup": ...}
+        new_note = result.get("note", "").strip()
+        new_warmup = result.get("warmup", {})
+        # 保留 last_run_date（用户改配置不影响今天是否已跑过的状态）
+        new_warmup["last_run_date"] = current_warmup.get("last_run_date", "")
+
+        meta.setdefault(name, {})["note"] = new_note
         self.pm.save_meta(meta)
+        self.pm.save_warmup(name, new_warmup)
         self._refresh_profiles()
-        self.set_status(f"已更新 '{name}' 的备注")
+        self.set_status(f"已更新「{name}」")
+
+    def _test_warmup(self, name: str, max_tokens: int, callback):
+        """从编辑弹窗触发的"立即测试"按钮 — 后台线程发请求，回调到主线程"""
+        def worker():
+            try:
+                is_active = (name == self.pm.get_current())
+                if is_active:
+                    ai = UsageFetcher.get_account_info()
+                else:
+                    cfg = INSTANCE_DIR / name / "config.json"
+                    if not cfg.exists():
+                        self.after(0, callback, False, "Profile 配置文件缺失")
+                        return
+                    ai = UsageFetcher.get_account_info(cfg)
+                token = ai.get("token")
+                if not token:
+                    self.after(0, callback, False, "没有可用的 token")
+                    return
+                prompt = random.choice(WARMUP_PROMPTS)
+                result = UsageFetcher.fetch_usage(token, max_tokens=max_tokens, prompt=prompt)
+                if result.get("ok"):
+                    pct = result.get("session_pct", 0)
+                    self.after(0, callback, True,
+                                f"测试成功，5h 已用 {pct}%（窗口已激活）")
+                else:
+                    self.after(0, callback, False,
+                                f"失败：{result.get('error', '未知错误')}")
+            except Exception as e:
+                self.after(0, callback, False, f"异常：{type(e).__name__}")
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def on_delete(self, name: str):
         """删除 profile"""
