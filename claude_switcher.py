@@ -27,7 +27,47 @@ import pystray
 ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ClaudeDesktopSwitcher.App")
 
 # === 配置 ===
-CLAUDE_DIR = Path(os.environ["APPDATA"]) / "Claude"
+
+def _detect_claude_dir() -> Path:
+    """自动检测 Claude Desktop 的会话目录。
+
+    支持两种安装：
+      1. 官方 Squirrel 版：  %APPDATA%\\Claude
+      2. Microsoft Store 版：%LOCALAPPDATA%\\Packages\\Claude_*\\LocalCache\\Roaming\\Claude
+
+    优先返回真实存在 config.json 的那个；都不存在时返回 Squirrel 默认路径
+    （让后续逻辑给出"未找到登录状态"的友好提示）。
+    """
+    appdata = Path(os.environ["APPDATA"])
+    local_appdata = Path(os.environ.get("LOCALAPPDATA", appdata.parent / "Local"))
+
+    candidates = []
+
+    # 1. Squirrel 版（最常见）
+    squirrel = appdata / "Claude"
+    candidates.append(squirrel)
+
+    # 2. Microsoft Store 版：包名带哈希后缀，匹配所有 Claude_* 目录
+    packages_dir = local_appdata / "Packages"
+    if packages_dir.exists():
+        try:
+            for pkg in packages_dir.iterdir():
+                if pkg.is_dir() and pkg.name.startswith("Claude_"):
+                    store_path = pkg / "LocalCache" / "Roaming" / "Claude"
+                    candidates.append(store_path)
+        except OSError:
+            pass
+
+    # 优先返回有 config.json 的（说明真的登录过）
+    for c in candidates:
+        if (c / "config.json").exists():
+            return c
+
+    # 都没登录过 → 返回 Squirrel 默认路径
+    return squirrel
+
+
+CLAUDE_DIR = _detect_claude_dir()
 INSTANCE_DIR = Path.home() / ".claude-instances"
 CURRENT_FILE = INSTANCE_DIR / "_current_profile"
 PROFILES_META = INSTANCE_DIR / "_profiles.json"
@@ -310,11 +350,13 @@ class ProfileManager:
         return False
 
     def start_claude(self):
+        # 1) 优先：用 Get-AppxPackage 找 Store 版（包名可能是 Claude / AnthropicClaude / Anthropic.* 之一）
         try:
             result = subprocess.run(
                 ["powershell", "-NoProfile", "-Command",
-                 "Get-AppxPackage -Name 'Claude' | Select-Object -ExpandProperty PackageFamilyName"],
-                capture_output=True, text=True, creationflags=0x08000000)
+                 "Get-AppxPackage | Where-Object { $_.Name -like '*laude*' -or $_.Name -like '*nthropic*' } | "
+                 "Select-Object -First 1 -ExpandProperty PackageFamilyName"],
+                capture_output=True, text=True, creationflags=0x08000000, timeout=10)
             family = result.stdout.strip()
             if family:
                 subprocess.Popen(["explorer.exe", f"shell:AppsFolder\\{family}!Claude"],
@@ -322,11 +364,17 @@ class ProfileManager:
                 return True
         except Exception:
             pass
+        # 2) 其次：Squirrel 版固定路径
         exe_path = Path(os.environ["LOCALAPPDATA"]) / "AnthropicClaude" / "claude.exe"
         if exe_path.exists():
             subprocess.Popen([str(exe_path)], creationflags=0x08000000)
             return True
-        return False
+        # 3) 最后兜底：让 Windows 自己找（处理把 claude.exe 加到 PATH 的边缘情况）
+        try:
+            subprocess.Popen(["claude.exe"], creationflags=0x08000000)
+            return True
+        except Exception:
+            return False
 
     def switch_profile(self, target: str, progress_cb=None,
                         on_old_usage_fetched=None) -> tuple[bool, str]:
@@ -379,7 +427,10 @@ class ProfileManager:
 
     def create_profile(self, name: str) -> tuple[bool, str]:
         if not (CLAUDE_DIR / "config.json").exists():
-            return False, "未找到 Claude 登录状态，请先登录"
+            return False, ("未找到 Claude Desktop 登录状态。\n"
+                           "请先：1) 安装 Claude Desktop  "
+                           "2) 启动并登录任意一个账号  "
+                           "3) 看到主界面后再回来保存 Profile")
         if (INSTANCE_DIR / name / "config.json").exists():
             return False, f"Profile '{name}' 已存在，请换个名称"
         self.stop_claude()
@@ -627,37 +678,44 @@ class UsageFetcher:
 # === 确认弹窗 ===
 
 class ConfirmDialog(ctk.CTkToplevel):
-    """自定义确认弹窗"""
+    """自定义确认弹窗。当 cancel_text 为空时只显示确认按钮（变成纯提示弹窗）"""
 
-    def __init__(self, parent, title: str, message: str, confirm_text="确认", cancel_text="取消"):
+    def __init__(self, parent, title: str, message: str,
+                  confirm_text="确认", cancel_text="取消"):
         super().__init__(parent)
         self.result = False
         self.title(title)
-        self.geometry("360x180")
+        # 自适应高度：根据消息行数估算
+        line_count = max(message.count("\n") + 1, 3)
+        h = max(200, 90 + line_count * 22)
+        w = 460
+        self.geometry(f"{w}x{h}")
         self.resizable(False, False)
         self.transient(parent)
         self.grab_set()
+        self.configure(fg_color=COLORS["bg_main"])
 
         # 居中
         self.update_idletasks()
-        x = parent.winfo_x() + (parent.winfo_width() - 360) // 2
-        y = parent.winfo_y() + (parent.winfo_height() - 180) // 2
+        x = parent.winfo_x() + (parent.winfo_width() - w) // 2
+        y = parent.winfo_y() + (parent.winfo_height() - h) // 2
         self.geometry(f"+{x}+{y}")
 
-        ctk.CTkLabel(self, text=message, font=("Microsoft YaHei UI", 13),
+        ctk.CTkLabel(self, text=message, font=("Microsoft YaHei UI", 12),
                      text_color=COLORS["text_primary"],
-                     wraplength=300).pack(pady=(30, 20))
+                     wraplength=w - 60, justify="left").pack(pady=(24, 16), padx=20)
 
         btn_frame = ctk.CTkFrame(self, fg_color="transparent")
-        btn_frame.pack(pady=10)
+        btn_frame.pack(pady=(4, 16))
 
-        ctk.CTkButton(btn_frame, text=cancel_text, width=100, height=32,
-                      fg_color=COLORS["bg_card"],
-                      hover_color=COLORS["track"],
-                      text_color=COLORS["text_secondary"],
-                      border_width=1,
-                      border_color=COLORS["border_default"],
-                      command=self._cancel).pack(side="left", padx=10)
+        if cancel_text:
+            ctk.CTkButton(btn_frame, text=cancel_text, width=100, height=32,
+                          fg_color=COLORS["bg_card"],
+                          hover_color=COLORS["track"],
+                          text_color=COLORS["text_secondary"],
+                          border_width=1,
+                          border_color=COLORS["border_default"],
+                          command=self._cancel).pack(side="left", padx=10)
         ctk.CTkButton(btn_frame, text=confirm_text, width=100, height=32,
                       fg_color=COLORS["accent"],
                       hover_color=COLORS["accent_hover"],
@@ -1406,6 +1464,29 @@ class App(ctk.CTk):
         self.after(1, self._enable_taskbar)
         if not self._usage_cache:
             self.after(500, self.on_refresh_usage)
+        # 启动后检查 Claude Desktop 环境：如果连 Claude 目录都没有，给明确提示
+        self.after(800, self._check_environment)
+
+    def _check_environment(self):
+        """启动检查：Claude Desktop 是否已安装并登录过。"""
+        # 没有任何 profile 且 Claude 配置目录也不存在 → 用户大概率没装/没登录 Claude Desktop
+        if self.pm.get_profiles():
+            return  # 已有 profile，跳过
+        if (CLAUDE_DIR / "config.json").exists():
+            return  # 当前已登录过 Claude Desktop
+        # 弹一个友好提示
+        try:
+            ConfirmDialog(self, "首次使用提示",
+                "未检测到 Claude Desktop 登录状态。\n\n"
+                "使用本工具前请先完成以下三步：\n"
+                "1. 在 https://claude.ai/download 下载并安装 Claude Desktop\n"
+                "2. 启动 Claude Desktop\n"
+                "3. 登录任意一个账号\n\n"
+                "之后回到本工具点「＋ 保存当前登录为新 Profile」即可创建首个 Profile。",
+                confirm_text="知道了",
+                cancel_text="").get_result()
+        except Exception:
+            self.set_status("未检测到 Claude Desktop 登录状态，请先登录后再创建 Profile")
 
     def _on_resize(self, event):
         """窗口尺寸变化时重新应用圆角形状"""
