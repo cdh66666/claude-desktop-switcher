@@ -25,3 +25,15 @@ Thumbs.db
 
 # 用户数据（不应该上传）
 **/.claude-instances/
+
+# 本机私用文件（不上传）
+_diagnostics/
+*.lnk
+本机使用说明.md
+安装桌面入口.ps1
+
+# 生成图文的中间 HTML（带本机绝对路径）
+docs/promo/slides/*.html
+
+# 整理对话工具的输出
+workspace-template/_tools/*.txt

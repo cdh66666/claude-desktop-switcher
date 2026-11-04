@@ -13,9 +13,13 @@ import time
 import ctypes
 import ctypes.wintypes
 import base64
+import math
+import re
 import socket
 import random
 from pathlib import Path
+
+import auto_switch
 from typing import Optional
 from datetime import datetime
 
@@ -253,6 +257,29 @@ class ProfileManager:
     def __init__(self):
         INSTANCE_DIR.mkdir(parents=True, exist_ok=True)
 
+    @staticmethod
+    def session_storage_error() -> Optional[str]:
+        """拒绝对被重定向或包含链接的会话目录执行破坏性替换。"""
+        try:
+            root = CLAUDE_DIR.resolve(strict=True)
+            for name in SESSION_FILES + SESSION_DIRS:
+                path = CLAUDE_DIR / name
+                if not path.exists():
+                    continue
+                if path.is_symlink() or (hasattr(path, 'is_junction') and path.is_junction()):
+                    return 'Claude 会话目录包含链接，无法安全切换；原会话未改动'
+                if not path.resolve(strict=True).is_relative_to(root):
+                    return 'Claude 会话目录被 Windows 重定向，无法安全切换；原会话未改动'
+                if path.is_dir():
+                    for item in path.rglob('*'):
+                        if item.is_symlink() or (hasattr(item, 'is_junction') and item.is_junction()):
+                            return 'Claude 会话目录包含链接，无法安全切换；原会话未改动'
+                        if not item.resolve(strict=True).is_relative_to(root):
+                            return 'Claude 会话目录被 Windows 重定向，无法安全切换；原会话未改动'
+        except (OSError, RuntimeError):
+            return '无法确认 Claude 会话目录是否安全；原会话未改动'
+        return None
+
     def get_current(self) -> Optional[str]:
         if CURRENT_FILE.exists():
             return CURRENT_FILE.read_text(encoding="utf-8").strip() or None
@@ -334,49 +361,434 @@ class ProfileManager:
                     shutil.rmtree(d_dest)
                 shutil.copytree(d_src, d_dest)
 
-    def stop_claude(self) -> bool:
+    # ---- Claude Desktop 进程识别 ----
+    # 只认桌面版（Electron）进程：exe 位于 AnthropicClaude\app-* 或 WindowsApps\*Claude*。
+    # 终端里单独跑的 Claude Code CLI（也叫 claude.exe，在 claude-code 目录或 npm 目录）不会被误杀。
+    _last_exe: Optional[str] = None
+
+    @staticmethod
+    def _is_desktop_exe(path: str) -> bool:
+        p = (path or "").lower().replace("/", "\\")
+        if not p.endswith("\\claude.exe"):
+            return False
+        if "\\claude-code\\" in p:
+            return False
+        return "\\anthropicclaude\\" in p or ("\\windowsapps\\" in p and "claude" in p)
+
+    @classmethod
+    def _desktop_processes(cls) -> list[tuple[int, int, str]]:
+        """返回 [(pid, ppid, exe_path)]，仅桌面版进程。用 Toolhelp + QueryFullProcessImageName，不依赖 WMI。"""
+        k32 = ctypes.windll.kernel32
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [("dwSize", ctypes.wintypes.DWORD), ("cntUsage", ctypes.wintypes.DWORD),
+                        ("th32ProcessID", ctypes.wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_void_p),
+                        ("th32ModuleID", ctypes.wintypes.DWORD), ("cntThreads", ctypes.wintypes.DWORD),
+                        ("th32ParentProcessID", ctypes.wintypes.DWORD), ("pcPriClassBase", ctypes.c_long),
+                        ("dwFlags", ctypes.wintypes.DWORD), ("szExeFile", ctypes.c_wchar * 260)]
+
+        k32.CreateToolhelp32Snapshot.restype = ctypes.wintypes.HANDLE
+        k32.OpenProcess.restype = ctypes.wintypes.HANDLE
+        snap = k32.CreateToolhelp32Snapshot(0x2, 0)
+        out = []
+        if not snap or snap == ctypes.wintypes.HANDLE(-1).value:
+            return out
         try:
-            subprocess.run(["taskkill", "/F", "/IM", "Claude.exe"],
-                           capture_output=True, text=True, creationflags=0x08000000)
+            e = PROCESSENTRY32W()
+            e.dwSize = ctypes.sizeof(e)
+            ok = k32.Process32FirstW(snap, ctypes.byref(e))
+            while ok:
+                if e.szExeFile.lower() == "claude.exe":
+                    h = k32.OpenProcess(0x1000, False, e.th32ProcessID)  # QUERY_LIMITED_INFORMATION
+                    if h:
+                        buf = ctypes.create_unicode_buffer(1024)
+                        n = ctypes.wintypes.DWORD(1024)
+                        if k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(n)):
+                            if cls._is_desktop_exe(buf.value):
+                                out.append((e.th32ProcessID, e.th32ParentProcessID, buf.value))
+                        k32.CloseHandle(h)
+                ok = k32.Process32NextW(snap, ctypes.byref(e))
+        finally:
+            k32.CloseHandle(snap)
+        return out
+
+    @staticmethod
+    def _send_end_session(pids) -> int:
+        """给这些进程的所有顶层窗口（含隐藏窗口）发 WM_ENDSESSION，返回发了几个窗口。"""
+        user32 = ctypes.windll.user32
+        targets = set(pids)
+        hwnds = []
+        WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+
+        def cb(hwnd, _):
+            pid = ctypes.wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value in targets:
+                hwnds.append(hwnd)
+            return True
+
+        user32.EnumWindows(WNDENUMPROC(cb), 0)
+        WM_ENDSESSION, ENDSESSION_CLOSEAPP = 0x0016, 0x00000001
+        result = ctypes.c_size_t()
+        for h in hwnds:
+            # SMTO_ABORTIFHUNG(2)，每个窗口最多等 3 秒
+            user32.SendMessageTimeoutW(h, WM_ENDSESSION, 1, ENDSESSION_CLOSEAPP, 0x2, 3000,
+                                       ctypes.byref(result))
+        return len(hwnds)
+
+    def is_claude_running(self) -> bool:
+        return bool(self._desktop_processes())
+
+    def stop_claude(self, timeout: float = 15.0) -> bool:
+        """强制退出 Claude Desktop（含托盘、子进程），等到进程全部消失、文件锁释放后返回 True。"""
+        procs = self._desktop_processes()
+        if not procs:
+            return True
+        ProfileManager._last_exe = procs[0][2]
+        pids = {p[0] for p in procs}
+        # 主进程 = 父进程不是桌面版进程的那个；/T 连同子进程（含桌面里跑的 Claude Code）一起结束
+        roots = [p[0] for p in procs if p[1] not in pids] or list(pids)
+        flags = 0x08000000
+        try:
+            # 1) 正常退出：给主进程的窗口发“Windows 要关机了”(WM_ENDSESSION)。
+            #    Claude 收到后会走自己的退出流程，把登录 cookie / 令牌写盘再退。
+            #    直接强杀可能丢掉刚刷新、还没写盘的登录信息，下次切回来就得重新登录。
+            self._send_end_session(roots)
+            deadline = time.time() + 12
+            while time.time() < deadline and self._desktop_processes():
+                time.sleep(0.25)
+            # 2) 还没退：普通 taskkill 再等一下
+            if self._desktop_processes():
+                for pid in roots:
+                    subprocess.run(["taskkill", "/PID", str(pid), "/T"], capture_output=True,
+                                   creationflags=flags, timeout=10)
+                deadline = time.time() + 2.5
+                while time.time() < deadline and self._desktop_processes():
+                    time.sleep(0.25)
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                left = self._desktop_processes()
+                if not left:
+                    time.sleep(1.0)  # 等 LevelDB / SQLite 文件锁释放
+                    return True
+                for pid, _, _ in left:
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True,
+                                   creationflags=flags, timeout=10)
+                time.sleep(0.5)
         except Exception:
             pass
-        for _ in range(30):
-            time.sleep(0.5)
-            check = subprocess.run(["tasklist", "/FI", "IMAGENAME eq Claude.exe"],
-                                   capture_output=True, text=True, creationflags=0x08000000)
-            if "Claude.exe" not in check.stdout:
-                time.sleep(1)
+        return not self._desktop_processes()
+
+    @classmethod
+    def _find_claude_exe(cls) -> Optional[Path]:
+        """找 Squirrel 启动器 claude.exe（它会自动跳到最新 app-* 版本）。"""
+        local = Path(os.environ.get("LOCALAPPDATA", ""))
+        cands: list[Path] = []
+        if cls._last_exe:  # 刚才关掉的那个：...\AnthropicClaude\app-x\claude.exe → 上一级启动器
+            last = Path(cls._last_exe)
+            cands += [last.parent.parent / "claude.exe", last]
+        cands.append(local / "AnthropicClaude" / "claude.exe")
+        # 被其他打包应用（如 Codex）虚拟化安装到 Packages\*\LocalCache 下的情况
+        try:
+            cands += sorted(local.glob("Packages/*/LocalCache/Local/AnthropicClaude/claude.exe"),
+                            key=lambda p: p.stat().st_mtime, reverse=True)
+        except OSError:
+            pass
+        # 开始菜单快捷方式
+        start_menu = Path(os.environ.get("APPDATA", "")) / "Microsoft/Windows/Start Menu/Programs"
+        for lnk in (start_menu / "Claude.lnk", start_menu / "Anthropic" / "Claude.lnk"):
+            if lnk.exists():
+                try:
+                    r = subprocess.run(
+                        ["powershell", "-NoProfile", "-Command",
+                         f"(New-Object -ComObject WScript.Shell).CreateShortcut('{lnk}').TargetPath"],
+                        capture_output=True, text=True, creationflags=0x08000000, timeout=10)
+                    t = r.stdout.strip()
+                    if t:
+                        cands.append(Path(t))
+                except Exception:
+                    pass
+        for c in cands:
+            if c.name.lower() == "claude.exe" and c.exists() and cls._is_desktop_exe(str(c)):
+                return c
+        return None
+
+    def start_claude(self, wait: float = 20.0) -> bool:
+        """启动 Claude Desktop，并等到进程真的起来才返回 True。"""
+        if self._desktop_processes():
+            return True
+        launched = False
+        exe = self._find_claude_exe()
+        if exe:
+            try:
+                # 脱离换号器进程，换号器退出也不影响 Claude
+                subprocess.Popen([str(exe)], cwd=str(exe.parent), close_fds=True,
+                                 creationflags=0x00000008 | 0x00000200)  # DETACHED | NEW_PROCESS_GROUP
+                launched = True
+            except Exception:
+                launched = False
+        if not launched:
+            # Microsoft Store 版：读清单里的真实 AppId
+            try:
+                r = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     "$p = Get-AppxPackage | Where-Object { $_.Name -match '^(Anthropic|Claude)' } | Select-Object -First 1; "
+                     "if ($p) { $id = (Get-AppxPackageManifest $p).Package.Applications.Application | "
+                     "Select-Object -First 1 -ExpandProperty Id; \"$($p.PackageFamilyName)!$id\" }"],
+                    capture_output=True, text=True, creationflags=0x08000000, timeout=15)
+                aumid = r.stdout.strip()
+                if "!" in aumid:
+                    subprocess.Popen(["explorer.exe", f"shell:AppsFolder\\{aumid}"],
+                                     creationflags=0x08000000)
+                    launched = True
+            except Exception:
+                pass
+        if not launched:
+            return False
+        deadline = time.time() + wait
+        while time.time() < deadline:
+            if self._desktop_processes():
                 return True
+            time.sleep(0.5)
         return False
 
-    def start_claude(self):
-        # 1) 优先：用 Get-AppxPackage 找 Store 版（包名可能是 Claude / AnthropicClaude / Anthropic.* 之一）
+    # ---- 切换后的检查：登录状态 / 设备标识 / 自动“继续” ----
+
+    @staticmethod
+    def _main_log() -> Optional[Path]:
+        local = Path(os.environ.get("LOCALAPPDATA", ""))
+        cands = [local / "Claude" / "logs" / "main.log"]
         try:
-            result = subprocess.run(
-                ["powershell", "-NoProfile", "-Command",
-                 "Get-AppxPackage | Where-Object { $_.Name -like '*laude*' -or $_.Name -like '*nthropic*' } | "
-                 "Select-Object -First 1 -ExpandProperty PackageFamilyName"],
-                capture_output=True, text=True, creationflags=0x08000000, timeout=10)
-            family = result.stdout.strip()
-            if family:
-                subprocess.Popen(["explorer.exe", f"shell:AppsFolder\\{family}!Claude"],
-                                 creationflags=0x08000000)
-                return True
+            cands += list(local.glob("Packages/*/LocalCache/Local/Claude/logs/main.log"))
+        except OSError:
+            pass
+        cands = [c for c in cands if c.exists()]
+        return max(cands, key=lambda p: p.stat().st_mtime) if cands else None
+
+    @classmethod
+    def log_offset(cls) -> tuple[Optional[Path], int]:
+        log = cls._main_log()
+        try:
+            return log, (log.stat().st_size if log else 0)
+        except OSError:
+            return log, 0
+
+    @staticmethod
+    def wait_login_state(log: Optional[Path], offset: int, timeout: float = 40.0) -> str:
+        """读 Claude 日志里启动之后的新内容：'ok' 已登录 / 'logged_out' 被登出 / 'unknown'。"""
+        if not log:
+            return "unknown"
+        seen_ok_at = None
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                with open(log, "rb") as fh:
+                    fh.seek(offset)
+                    text = fh.read().decode("utf-8", "replace")
+            except OSError:
+                text = ""
+            if ("Navigated to /logout" in text or "loggedOut: false → true" in text
+                    or ("User is logged out" in text and "account active and logged in" not in text)):
+                return "logged_out"
+            if seen_ok_at is None and "account active and logged in" in text:
+                seen_ok_at = time.time()
+            # 登录后服务器可能过几秒才拒绝旧会话（403 → 登出），多看 8 秒
+            if seen_ok_at and time.time() - seen_ok_at > 8:
+                return "ok"
+            time.sleep(1)
+        return "ok" if seen_ok_at else "unknown"
+
+    @staticmethod
+    def _file_hash(p: Path) -> Optional[str]:
+        import hashlib
+        try:
+            return hashlib.sha256(p.read_bytes()).hexdigest()
+        except OSError:
+            return None
+
+    def shared_device_profiles(self, name: str) -> list[str]:
+        """和 name 共用同一个设备标识(ant-did)的其他 profile。共用的账号会被服务器互相踢下线。"""
+        mine = self._file_hash(INSTANCE_DIR / name / "ant-did")
+        if not mine:
+            return []
+        return [p for p in self.get_profiles()
+                if p != name and self._file_hash(INSTANCE_DIR / p / "ant-did") == mine]
+
+    def reset_device_identity(self) -> bool:
+        """关掉 Claude，删掉设备标识(ant-did)和 cookie，再打开：重新登录后就是一台“新设备”。"""
+        if not self.stop_claude():
+            return False
+        for p in [CLAUDE_DIR / "ant-did",
+                  CLAUDE_DIR / "Network" / "Cookies",
+                  CLAUDE_DIR / "Network" / "Cookies-journal"]:
+            try:
+                if p.exists():
+                    p.unlink()
+            except OSError:
+                pass
+        return self.start_claude()
+
+    # 自动“继续”的设置（改 ~/.claude-instances/_settings.json；folder 留空 = 不限文件夹）
+    SETTINGS_FILE = INSTANCE_DIR / "_settings.json"
+    DEFAULT_SETTINGS = {"auto_continue": True, "folder": "",
+                        "text": "继续", "session_title": "总控"}
+
+    def get_settings(self) -> dict:
+        s = dict(self.DEFAULT_SETTINGS)
+        try:
+            s.update(json.loads(self.SETTINGS_FILE.read_text(encoding="utf-8")))
         except Exception:
             pass
-        # 2) 其次：Squirrel 版固定路径
-        exe_path = Path(os.environ["LOCALAPPDATA"]) / "AnthropicClaude" / "claude.exe"
-        if exe_path.exists():
-            subprocess.Popen([str(exe_path)], creationflags=0x08000000)
-            return True
-        # 3) 最后兜底：让 Windows 自己找（处理把 claude.exe 加到 PATH 的边缘情况）
+        return s
+
+    def save_settings(self, s: dict):
+        self.SETTINGS_FILE.write_text(json.dumps(s, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    @staticmethod
+    def current_account_uuid() -> Optional[str]:
         try:
-            subprocess.Popen(["claude.exe"], creationflags=0x08000000)
-            return True
+            cfg = json.loads((CLAUDE_DIR / "config.json").read_text(encoding="utf-8"))
+            u = cfg.get("lastKnownAccountUuid")
+            return u.lower() if isinstance(u, str) else None
         except Exception:
-            return False
+            return None
+
+    def find_control_session(self, account: Optional[str], settings: dict) -> Optional[str]:
+        """在当前账号的桌面版代码对话里找标题为“总控”、没归档、在指定文件夹的那个。"""
+        if not account:
+            return None
+        base = CLAUDE_DIR / "claude-code-sessions" / account
+        folder = settings.get("folder") or ""
+        want_cwd = os.path.normcase(os.path.normpath(folder)) if folder else ""
+        best = None
+        try:
+            files = list(base.glob("*/local_*.json"))
+        except OSError:
+            return None
+        for f in files:
+            try:
+                j = json.loads(f.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if j.get("isArchived") or (j.get("title") or "").strip() != settings.get("session_title"):
+                continue
+            cwd = os.path.normcase(os.path.normpath(j.get("cwd") or ""))
+            if want_cwd and cwd != want_cwd:
+                continue
+            key = j.get("lastActivityAt") or 0
+            if best is None or key > best[0]:
+                best = (key, j.get("sessionId"))
+        sid = best[1] if best else None
+        return sid if isinstance(sid, str) and re.fullmatch(r"local_[A-Za-z0-9-]{1,64}", sid) else None
+
+    def run_auto_continue(self) -> tuple[bool, str]:
+        s = self.get_settings()
+        script = Path(__file__).with_name("auto_continue.ps1")
+        if not script.exists():
+            return False, "缺少 auto_continue.ps1"
+        sid = self.find_control_session(self.current_account_uuid(), s)
+        if not sid and not s.get("folder"):
+            return False, f"没找到「{s['session_title']}」对话，没发「{s['text']}」"
+        args = self.auto_continue_args(script, s, sid)
+        return self.interpret_auto_continue(s, sid, self._run_ps)(args)
+
+    @staticmethod
+    def auto_continue_args(script: Path, s: dict, sid: Optional[str]) -> list:
+        args = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script),
+                "-Text", s["text"], "-TimeoutSec", "90"]
+        if sid:
+            args += ["-SessionId", sid, "-ExpectTitle", s["session_title"]]
+        else:
+            args += ["-Folder", s["folder"]]
+        return args
+
+    @staticmethod
+    def _run_ps(args) -> tuple[int, str]:
+        r = subprocess.run(args, capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", creationflags=0x08000000, timeout=180)
+        return r.returncode, (r.stdout or "").strip()
+
+    @staticmethod
+    def interpret_auto_continue(s: dict, sid: Optional[str], runner):
+        """返回一个函数：跑脚本并把退出码翻成给用户看的一句话。
+        5 = 没确认是目标对话（脚本保证没打字没回车）。新开对话绝不重试，免得开出好几个。"""
+        title, text = s["session_title"], s["text"]
+        manual = f"请自己到「{title}」发「{text}」" if sid else f"请自己在 {s['folder']} 新开对话发「{text}」"
+
+        def go(args):
+            code = -1
+            for attempt in range(2 if sid else 1):
+                try:
+                    code, _out = runner(args)
+                except Exception as e:
+                    return False, f"自动发「{text}」失败：{type(e).__name__}，{manual}"
+                if code in (0, 2, 3):
+                    break
+                # 4/5：只有打开已有的总控才重试一次（脚本每次都会重新核对）
+            if code == 0:
+                if sid:
+                    return True, f"已在「{title}」发「{text}」"
+                return True, f"新开了对话并发「{text}」（它会自己改名「{title}」）"
+            if code == 2:
+                return False, f"没等到输入框，没发「{text}」"
+            if code == 3:
+                return False, f"输入框里的字对不上（可能有草稿），没发。{manual}"
+            if code == 5:
+                what = f"「{title}」" if sid else "新对话"
+                return False, f"没确认打开的是{what}，没发。{manual}"
+            return False, f"没能自动发「{text}」，{manual}"
+        return go
+
+    def after_start(self, target: str, log: Optional[Path], offset: int,
+                    progress_cb=None) -> str:
+        """Claude 启动后：确认登录状态；被登出时处理设备标识冲突；登录正常就自动发“继续”。"""
+        if progress_cb:
+            progress_cb("检查登录状态...")
+        state = self.wait_login_state(log, offset)
+        if state == "logged_out":
+            shared = self.shared_device_profiles(target)
+            if shared:
+                if progress_cb:
+                    progress_cb("换独立设备标识...")
+                self.reset_device_identity()
+                return (f"「{target}」被服务器登出了：它和「{'、'.join(shared)}」共用一个设备标识，会互相踢。"
+                        f"已给它换了新标识，请在 Claude 里重新登录一次，以后不会再互踢")
+            return f"「{target}」被服务器登出了，请在 Claude 里重新登录；下次切换会自动保存新登录"
+        if state == "unknown":
+            return f"已切换到「{target}」（没确认到登录状态，请看一眼 Claude）"
+        msg = f"已切换到「{target}」"
+        if self.get_settings().get("auto_continue"):
+            if progress_cb:
+                progress_cb("自动发「继续」...")
+            ok, m = self.run_auto_continue()
+            msg += "，" + m
+        return msg
 
     def switch_profile(self, target: str, progress_cb=None,
+                       on_old_usage_fetched=None) -> tuple[bool, str]:
+        """切换并把每一步花的时间记到 self.last_switch_record（给换号复盘用）。"""
+        t0 = time.time()
+        steps = []
+
+        def cb(text):
+            steps.append([text.rstrip('.。'), round(time.time() - t0, 1)])
+            if progress_cb:
+                progress_cb(text)
+
+        rec = {"at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "from": self.get_current(),
+               "to": target, "auto_continue": bool(self.get_settings().get("auto_continue"))}
+        ok, msg = False, ""
+        try:
+            ok, msg = self._switch_profile(target, cb, on_old_usage_fetched)
+        except Exception as e:
+            msg = f"出错：{type(e).__name__} {e}"
+            raise
+        finally:
+            rec.update(ok=ok, msg=msg, steps=steps, total_sec=round(time.time() - t0, 1))
+            self.last_switch_record = rec
+        return ok, msg
+
+    def _switch_profile(self, target: str, progress_cb=None,
                         on_old_usage_fetched=None) -> tuple[bool, str]:
         """
         切换到目标 profile。
@@ -389,6 +801,10 @@ class ProfileManager:
             return False, f"Profile '{target}' 不存在"
         if current == target:
             return False, f"已经在 '{target}' 上了"
+
+        storage_error = self.session_storage_error()
+        if storage_error:
+            return False, storage_error
 
         # 切换前：先抓一次旧账号的用量（只调一次 API）
         # 这是"切换即刷新"的精妙之处——反正都要切了，顺便把被切走的账号状态更新一下
@@ -411,7 +827,7 @@ class ProfileManager:
         if progress_cb:
             progress_cb("正在关闭 Claude...")
         if not self.stop_claude():
-            return False, "无法关闭 Claude，请手动退出后重试"
+            return False, "Claude 没能在 15 秒内退出，原会话未改动；请在任务管理器结束 Claude 后重试"
         if progress_cb:
             progress_cb("保存当前会话...")
         if current:
@@ -422,8 +838,10 @@ class ProfileManager:
         self.set_current(target)
         if progress_cb:
             progress_cb("启动 Claude...")
-        self.start_claude()
-        return True, f"已切换到 '{target}'"
+        log, offset = self.log_offset()
+        if not self.start_claude():
+            return False, f"已加载 '{target}'，但 Claude 未能启动；请手动启动并核对账号"
+        return True, self.after_start(target, log, offset, progress_cb)
 
     def create_profile(self, name: str) -> tuple[bool, str]:
         if not (CLAUDE_DIR / "config.json").exists():
@@ -433,7 +851,11 @@ class ProfileManager:
                            "3) 看到主界面后再回来保存 Profile")
         if (INSTANCE_DIR / name / "config.json").exists():
             return False, f"Profile '{name}' 已存在，请换个名称"
-        self.stop_claude()
+        storage_error = self.session_storage_error()
+        if storage_error:
+            return False, storage_error
+        if not self.stop_claude():
+            return False, "Claude 没能退出，请在任务管理器结束 Claude 后重试"
         time.sleep(1)
         self.save_session(name)
         self.set_current(name)
@@ -510,8 +932,9 @@ class UsageFetcher:
         return bytes(pb[:co.value])
 
     @classmethod
-    def decrypt_oauth_cache(cls, config_path: Path = None) -> dict:
-        """解密 Claude Desktop 的 oauth:tokenCache，返回 token 信息"""
+    def decrypt_oauth_cache(cls, config_path: Path = None,
+                            cache_key: str = 'oauth:tokenCache') -> dict:
+        """解密指定版本的 Claude Desktop OAuth 缓存；不改写凭据。"""
         try:
             local_state = CLAUDE_DIR / 'Local State'
             if not local_state.exists():
@@ -528,7 +951,7 @@ class UsageFetcher:
             if not cfg_path.exists():
                 return {}
             cfg = json.loads(cfg_path.read_text(encoding='utf-8'))
-            enc_b64 = cfg.get('oauth:tokenCache', '')
+            enc_b64 = cfg.get(cache_key, '')
             if not enc_b64:
                 return {}
 
@@ -547,16 +970,66 @@ class UsageFetcher:
 
     @classmethod
     def get_account_info(cls, config_path: Path = None) -> dict:
-        """获取当前账号信息（不需要网络）"""
-        token_data = cls.decrypt_oauth_cache(config_path)
-        if not token_data:
-            return {"plan": "未知", "token": None, "expires": None}
+        """从新版或旧版 OAuth 缓存选择可用于推理的当前账号令牌。"""
+        unavailable = {"plan": "未知", "token": None, "expires": None}
+        cfg_path = config_path or (CLAUDE_DIR / 'config.json')
+        try:
+            cfg = json.loads(cfg_path.read_text(encoding='utf-8'))
+            if not isinstance(cfg, dict):
+                raise ValueError('invalid config')
+        except (OSError, ValueError, TypeError):
+            return {**unavailable, "error": "无法读取账号配置"}
 
-        # 取第一个 entry
-        first_key = list(token_data.keys())[0]
-        entry = token_data[first_key]
+        account_id = cfg.get('lastKnownAccountUuid')
+        account_id = account_id.lower() if isinstance(account_id, str) else None
+        cache_keys = ('oauth:tokenCacheV2', 'oauth:tokenCache')
+        if not any(cfg.get(key) for key in cache_keys):
+            return {**unavailable, "error": "账号配置中没有 OAuth 登录令牌"}
+
+        candidates = []
+        for priority, cache_key in enumerate(cache_keys):
+            token_data = cls.decrypt_oauth_cache(config_path, cache_key)
+            if not isinstance(token_data, dict):
+                continue
+            for key, entry in token_data.items():
+                if not isinstance(key, str) or not isinstance(entry, dict):
+                    continue
+                token = entry.get('token')
+                if not isinstance(token, str) or not token:
+                    continue
+                scopes = set(re.findall(r'user:[A-Za-z0-9_-]+', key))
+                if scopes and 'user:inference' not in scopes:
+                    continue
+                scoped_account = key[5:].split('|', 1)[0].lower() if key.startswith('acct:') and '|' in key else None
+                if account_id and scoped_account and scoped_account != account_id:
+                    continue
+                org = re.search(r':([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}):https?://', key, re.I)
+                expires_ms = entry.get('expiresAt', 0)
+                if isinstance(expires_ms, bool) or not isinstance(expires_ms, (int, float)):
+                    continue
+                try:
+                    finite_expiry = math.isfinite(expires_ms)
+                except OverflowError:
+                    continue
+                if not finite_expiry:
+                    continue
+                candidates.append((priority, scoped_account, org.group(1).lower() if org else None, expires_ms, entry))
+
+        if not candidates:
+            return {**unavailable, "error": "登录令牌无法读取，或不具备用量查询权限"}
+        accounts = {item[1] for item in candidates if item[1]}
+        organizations = {item[2] for item in candidates if item[2]}
+        if (not account_id and len(accounts) > 1) or len(organizations) > 1:
+            return {**unavailable, "error": "登录令牌对应多个账号或组织，无法安全确认用量归属"}
+        valid = [item for item in candidates if item[3] > time.time() * 1000]
+        if not valid:
+            return {**unavailable, "error": "登录令牌已过期或没有有效到期时间"}
+        # 优先 V2；同版本内选择有效期更长的令牌，不刷新或改写登录数据。
+        entry = min(valid, key=lambda item: (item[0], -item[3]))[4]
         plan = entry.get('subscriptionType', 'unknown')
         tier = entry.get('rateLimitTier', '')
+        plan = plan if isinstance(plan, str) else ''
+        tier = tier if isinstance(tier, str) else ''
         token = entry.get('token', '')
         expires_ms = entry.get('expiresAt', 0)
 
@@ -566,8 +1039,11 @@ class UsageFetcher:
         # 过期时间
         expires_str = ""
         if expires_ms:
-            dt = datetime.fromtimestamp(expires_ms / 1000)
-            expires_str = dt.strftime("%Y-%m-%d %H:%M")
+            try:
+                dt = datetime.fromtimestamp(expires_ms / 1000)
+                expires_str = dt.strftime("%Y-%m-%d %H:%M")
+            except (OverflowError, OSError, ValueError):
+                return {**unavailable, "error": "登录令牌的到期时间无效"}
 
         return {
             "plan": plan_display,
@@ -632,7 +1108,10 @@ class UsageFetcher:
                     result['weekly_pct'] = int(round(float(util_7d) * 100))
                 if reset_7d:
                     result['weekly_reset_epoch'] = int(reset_7d)
-                result['ok'] = True
+                if 'session_pct' in result or 'weekly_pct' in result:
+                    result['ok'] = True
+                else:
+                    result['error'] = "服务未返回用量百分比"
             elif r.status_code == 429:
                 # 额度耗尽 — 即使 429 响应，header 里也可能带 reset 信息
                 result['fetched_at'] = int(time.time())
@@ -643,12 +1122,10 @@ class UsageFetcher:
                 reset_5h = h.get('anthropic-ratelimit-unified-5h-reset')
                 util_7d = h.get('anthropic-ratelimit-unified-7d-utilization')
                 reset_7d = h.get('anthropic-ratelimit-unified-7d-reset')
-                # 推断哪个窗口爆了
+                # 只展示响应里实际返回的百分比，不推断耗尽的窗口。
                 if util_5h:
                     pct = float(util_5h) * 100
-                    result['session_pct'] = max(int(round(pct)), 100)
-                else:
-                    result['session_pct'] = 100  # 假定 5h 满了
+                    result['session_pct'] = int(round(pct))
                 if reset_5h:
                     result['session_reset_epoch'] = int(reset_5h)
                 if util_7d:
@@ -1414,6 +1891,112 @@ class WarmupScheduler(threading.Thread):
         self.pm.save_warmup(name, warmup)
 
 
+# === 额度用完自动换号 ===
+
+class AutoSwitcher(threading.Thread):
+    """后台每 3 分钟看一次当前号的额度，用完了就挑一个号切过去（挑号/防抖逻辑在 auto_switch.py）。"""
+
+    def __init__(self, app):
+        super().__init__(daemon=True, name="AutoSwitcher")
+        self.app = app
+        self.pm = app.pm
+        self.state = auto_switch.State(INSTANCE_DIR)
+        self._stop_event = threading.Event()
+        self._next_probe = 0
+        self._last_note = None
+
+    def stop(self):
+        self._stop_event.set()
+
+    def cfg(self) -> dict:
+        c = dict(auto_switch.DEFAULTS)
+        c.update(self.pm.get_settings())
+        return c
+
+    def run(self):
+        if self._stop_event.wait(45):
+            return
+        while not self._stop_event.is_set():
+            try:
+                self._tick()
+            except Exception as e:
+                self.state.log(f"出错：{type(e).__name__} {e}")
+            if self._stop_event.wait(60):
+                break
+
+    def _note(self, text: str, log: bool = True):
+        """界面上显示一句；变了才写日志。"""
+        if text == self._last_note:
+            return
+        self._last_note = text
+        if log and text:
+            self.state.log(text)
+        self.app.after(0, self.app._show_auto_info, text)
+
+    def _probe(self, name: str, live: bool) -> Optional[dict]:
+        ai = UsageFetcher.get_account_info() if live else \
+            UsageFetcher.get_account_info(INSTANCE_DIR / name / "config.json")
+        tok = ai.get("token")
+        if not tok:
+            return None
+        u = UsageFetcher.fetch_usage(tok)
+        self.app._cache_usage(name, u)
+        return u if (u.get("ok") or u.get("rate_limited") or u.get("token_invalid")) else None
+
+    def _tick(self):
+        cfg = self.cfg()
+        if not cfg.get("auto_switch") or self.app.is_switching:
+            return
+        current = self.pm.get_current()
+        if not current or not self.pm.is_claude_running():
+            return
+        now = time.time()
+        with self.app._cache_lock:
+            cur = self.app._usage_cache.get(current)
+        if now >= self._next_probe:
+            old_pct = (cur or {}).get("session_pct")
+            u = self._probe(current, live=True)
+            if u and not u.get("token_invalid"):
+                cur = u
+                if u.get("session_pct") != old_pct:
+                    self.app.after(0, self.app._refresh_profiles)
+            self._next_probe = now + auto_switch.CHECK_SEC
+        pct = auto_switch.eff_session(cur, now)
+        last = max(self.state.data.get("last_switch_at", 0), self.app._last_manual_switch_at)
+        d = auto_switch.decide(cur, now, last)
+        if d == "ok":
+            self._note("", log=False)
+            return
+        if d == "cooldown":
+            self._note(f"「{current}」额度用完，刚换过号，过几分钟再换")
+            return
+        # 要换：先把数据旧的候选号刷新一下（只刷还在 5 小时窗口里的、或没数据的）
+        profiles = self.pm.get_profiles()
+        with self.app._cache_lock:
+            snap = dict(self.app._usage_cache)
+        for name in profiles:
+            if name == current:
+                continue
+            u = snap.get(name)
+            if u and u.get("token_invalid"):
+                continue
+            stale = u is None or ((u.get("session_reset_epoch") or 0) > now
+                                  and now - (u.get("fetched_at") or 0) > 20 * 60)
+            if stale:
+                self._probe(name, live=False)
+        with self.app._cache_lock:
+            snap = dict(self.app._usage_cache)
+        target, why, nxt = auto_switch.pick_target(
+            profiles, current, snap, now, self.state.data.get("failures", {}))
+        if not target:
+            tail = f"，最早 {auto_switch.fmt_hm(nxt)} 有号恢复" if nxt else ""
+            self._note(f"「{current}」额度用完，没有可换的号{tail}")
+            return
+        reason = f"「{current}」额度用完（5小时 {pct}%）→「{target}」（{why}）"
+        self._last_note = None
+        self.app.after(0, self.app._begin_auto_switch, target, reason)
+
+
 # === 主窗口 ===
 
 class App(ctk.CTk):
@@ -1459,6 +2042,11 @@ class App(ctk.CTk):
         # 启动 5h 窗口预热调度器（守护线程，App 退出时自动结束）
         self._warmup_scheduler = WarmupScheduler(self.pm, on_status=self._on_warmup_status)
         self._warmup_scheduler.start()
+        # 额度用完自动换号（守护线程）
+        self._last_manual_switch_at = 0
+        self._auto_switcher = AutoSwitcher(self)
+        self._auto_switcher.start()
+        self._show_auto_info("")
         self.bind("<Configure>", self._on_resize)
         # UI 全部就绪后再启用 taskbar 显示并 deiconify 窗口
         self.after(1, self._enable_taskbar)
@@ -1805,6 +2393,44 @@ class App(ctk.CTk):
                                             command=self.on_new_login)
         self.new_login_btn.pack(fill="x", pady=(0, 4))
 
+        # 切换后自动发“继续”
+        s = self.pm.get_settings()
+        self.auto_continue_var = ctk.BooleanVar(value=bool(s.get("auto_continue")))
+
+        def _toggle_auto():
+            cur = self.pm.get_settings()
+            cur["auto_continue"] = bool(self.auto_continue_var.get())
+            self.pm.save_settings(cur)
+
+        ctk.CTkCheckBox(bottom, variable=self.auto_continue_var, command=_toggle_auto,
+                        text=f"切换后在「{s['session_title']}」发「{s['text']}」",
+                        font=("Microsoft YaHei UI", 12),
+                        text_color=COLORS["text_secondary"],
+                        fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"],
+                        checkbox_width=18, checkbox_height=18).pack(anchor="w", pady=(4, 0))
+
+        # 额度用完自动换号
+        a = dict(auto_switch.DEFAULTS)
+        a.update(s)
+        self.auto_switch_var = ctk.BooleanVar(value=bool(a.get("auto_switch")))
+
+        def _toggle_switch():
+            cur = self.pm.get_settings()
+            cur["auto_switch"] = bool(self.auto_switch_var.get())
+            self.pm.save_settings(cur)
+            self._show_auto_info("")
+
+        ctk.CTkCheckBox(bottom, variable=self.auto_switch_var, command=_toggle_switch,
+                        text="额度用完自动换号",
+                        font=("Microsoft YaHei UI", 12),
+                        text_color=COLORS["text_secondary"],
+                        fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"],
+                        checkbox_width=18, checkbox_height=18).pack(anchor="w", pady=(4, 0))
+        self.auto_info_var = ctk.StringVar(value="")
+        ctk.CTkLabel(bottom, textvariable=self.auto_info_var,
+                     font=("Microsoft YaHei UI", 11), text_color=COLORS["text_tertiary"],
+                     wraplength=440, justify="left").pack(anchor="w", padx=(26, 0))
+
         # 状态栏
         self.status_var = ctk.StringVar(value="就绪")
         self.status_label = ctk.CTkLabel(bottom, textvariable=self.status_var,
@@ -1958,7 +2584,7 @@ class App(ctk.CTk):
             ai = UsageFetcher.get_account_info(cfg)
         token = ai.get('token')
         if not token:
-            self.set_status(f"「{name}」没有可用的 token")
+            self.set_status(f"「{name}」{ai.get('error', '没有可用的登录令牌')}")
             return
 
         # 禁用对应卡片的刷新按钮
@@ -2012,6 +2638,7 @@ class App(ctk.CTk):
 
         # 收集每个 profile 的 token
         targets = []
+        missing = {}
         for name in profiles:
             is_active = (name == self.pm.get_current())
             if is_active:
@@ -2019,22 +2646,29 @@ class App(ctk.CTk):
             else:
                 cfg = INSTANCE_DIR / name / "config.json"
                 if not cfg.exists():
+                    missing[name] = {'error': '账号配置缺失'}
                     continue
                 ai = UsageFetcher.get_account_info(cfg)
             token = ai.get('token')
             if token:
                 targets.append((name, token))
+            else:
+                missing[name] = {'error': ai.get('error', '没有可用的登录令牌')}
 
         # 重新渲染卡片，显示"加载中"
         self._refresh_profiles(fetch_usage=False)
 
-        # 后台并发获取所有账号的用量
-        threading.Thread(target=self._fetch_all_usage, args=(targets,), daemon=True).start()
+        if not targets:
+            self._on_all_usage_done(missing)
+            return
 
-    def _fetch_all_usage(self, targets: list):
+        # 后台并发获取所有有令牌的账号；缺少令牌的账号也要报告失败。
+        threading.Thread(target=self._fetch_all_usage, args=(targets, missing), daemon=True).start()
+
+    def _fetch_all_usage(self, targets: list, missing: dict = None):
         """并发获取所有账号的用量数据"""
         threads = []
-        results = {}
+        results = dict(missing or {})
         lock = threading.Lock()
 
         def worker(name, token):
@@ -2071,11 +2705,86 @@ class App(ctk.CTk):
         if not failed:
             self.set_status(f"{success_count}/{total} 账号已更新（{ts}）")
         else:
-            # 列出哪些账号失败
-            fail_names = "、".join(name for name, _ in failed)
-            self.set_status(f"{success_count}/{total} 账号已更新，{fail_names} 失败")
+            reasons = {reason for _, reason in failed}
+            details = (next(iter(reasons)) if len(reasons) == 1
+                       else "；".join(f"{name}: {reason}" for name, reason in failed))
+            self.set_status(f"{success_count}/{total} 账号已更新；{details}")
         # 重新渲染卡片以显示新数据
         self._refresh_profiles(fetch_usage=False)
+
+    def _switch_and_record(self, name: str, kind: str, reason: str = "") -> tuple[bool, str]:
+        """后台线程里切换；切完查一次新号用量，再写一条换号记录（_switch_history.jsonl）供复盘。"""
+        with self._cache_lock:
+            before = dict(self._usage_cache.get(name) or {})
+        success, msg = self.pm.switch_profile(name,
+            progress_cb=lambda t: self.after(0, self.set_status, t),
+            on_old_usage_fetched=self._cache_usage)
+        after = None
+        if success:
+            try:
+                new_token = UsageFetcher.get_account_info().get('token')
+                if new_token:
+                    after = UsageFetcher.fetch_usage(new_token)
+                    self._cache_usage(name, after)
+            except Exception:
+                pass
+        try:
+            now = time.time()
+            rec = dict(getattr(self.pm, "last_switch_record", None) or {"to": name, "ok": success, "msg": msg})
+            rec.update(kind=kind, reason=reason, target_before=auto_switch.brief(before, now),
+                       target_after=auto_switch.brief(after, now))
+            auto_switch.append_history(INSTANCE_DIR, rec)
+        except Exception:
+            pass
+        return success, msg
+
+    def _show_auto_info(self, note: str):
+        """自动换号那一行：等待中的提示优先，否则显示上次自动换号。"""
+        if not hasattr(self, "auto_info_var"):
+            return
+        if not self.auto_switch_var.get():
+            self.auto_info_var.set("")
+            return
+        sw = getattr(self, "_auto_switcher", None)
+        last = sw.state.data.get("last_info", "") if sw else ""
+        self.auto_info_var.set(note or (f"上次：{last}" if last else ""))
+
+    def _begin_auto_switch(self, name: str, reason: str):
+        """主线程：开始一次自动换号（走和托盘一样的切换流程，切完照旧发“继续”）。"""
+        if self.is_switching or not self.auto_switch_var.get():
+            return
+        st = self._auto_switcher.state
+        st.data["last_switch_at"] = time.time()
+        st.data["last_info"] = f"{datetime.now():%H:%M} {reason}"
+        st.save()
+        st.log("开始自动换号：" + reason)
+        self.is_switching = True
+        self.create_btn.configure(state="disabled")
+        self.new_login_btn.configure(state="disabled")
+        self._show_auto_info("")
+        self.set_status("自动换号：" + reason)
+
+        def do_switch():
+            success, msg = self._switch_and_record(name, "自动", reason)
+            if not success or "登出" in msg:
+                st.data.setdefault("failures", {})[name] = time.time()
+                st.data["last_info"] += "（失败）"
+                st.log(f"自动换号失败：{msg}")
+            else:
+                st.log(f"自动换号完成：{msg}")
+            st.save()
+
+            def finish():
+                self.is_switching = False
+                self.create_btn.configure(state="normal")
+                self.new_login_btn.configure(state="normal")
+                self.set_status(msg)
+                self._show_auto_info("")
+                self._refresh_profiles()
+                self._update_tray_menu()
+            self.after(0, finish)
+
+        threading.Thread(target=do_switch, daemon=True).start()
 
     def set_status(self, text: str):
         self.status_var.set(text)
@@ -2085,32 +2794,25 @@ class App(ctk.CTk):
         """切换 profile（带确认弹窗）"""
         if self.is_switching:
             return
+        storage_error = self.pm.session_storage_error()
+        if storage_error:
+            self.set_status(storage_error)
+            return
         # 确认弹窗
         dialog = ConfirmDialog(self, "切换确认",
-                               f"确定要切换到 「{name}」 吗？\n\nClaude Desktop 将会重启。",
+                               f"确定要切换到 「{name}」 吗？\n\nClaude Desktop 会被强制关闭再重启，\n里面正在跑的对话会被中断（记录保留，之后发“继续”接上）。",
                                confirm_text="切换")
         if not dialog.get_result():
             return
 
         self.is_switching = True
+        self._last_manual_switch_at = time.time()
         self.create_btn.configure(state="disabled")
         self.new_login_btn.configure(state="disabled")
 
         def do_switch():
             # 切换前自动获取旧账号用量，同时更新目标账号用量
-            success, msg = self.pm.switch_profile(name,
-                progress_cb=lambda t: self.after(0, self.set_status, t),
-                on_old_usage_fetched=self._cache_usage)
-
-            # 切换成功后再调用一次 API 获取新账号的用量
-            if success:
-                try:
-                    new_info = UsageFetcher.get_account_info()
-                    new_token = new_info.get('token')
-                    if new_token:
-                        self._cache_usage(name, UsageFetcher.fetch_usage(new_token))
-                except Exception:
-                    pass
+            success, msg = self._switch_and_record(name, "按钮")
 
             def finish():
                 self.is_switching = False
@@ -2127,8 +2829,12 @@ class App(ctk.CTk):
         """重新加载当前 profile 的已保存会话"""
         if self.is_switching:
             return
+        storage_error = self.pm.session_storage_error()
+        if storage_error:
+            self.set_status(storage_error)
+            return
         dialog = ConfirmDialog(self, "重载确认",
-                               f"重新加载 「{name}」 的已保存登录状态？\n\nClaude Desktop 将会重启。",
+                               f"重新加载 「{name}」 的已保存登录状态？\n\nClaude Desktop 会被强制关闭再重启，正在跑的对话会被中断。",
                                confirm_text="重载")
         if not dialog.get_result():
             return
@@ -2137,17 +2843,23 @@ class App(ctk.CTk):
         self.create_btn.configure(state="disabled")
 
         def do_reload():
-            self.after(0, self.set_status, "正在关闭 Claude...")
-            self.pm.stop_claude()
+            if not self.pm.stop_claude():
+                def blocked():
+                    self.is_switching = False
+                    self.create_btn.configure(state="normal")
+                    self.set_status("Claude 没能退出，原会话未改动；请在任务管理器结束 Claude 后重试")
+                self.after(0, blocked)
+                return
             time.sleep(1)
             self.after(0, self.set_status, "重新加载会话...")
             self.pm.load_session(name)
             self.after(0, self.set_status, "启动 Claude...")
-            self.pm.start_claude()
+            started = self.pm.start_claude()
             def finish():
                 self.is_switching = False
                 self.create_btn.configure(state="normal")
-                self.set_status(f"已重载 '{name}'")
+                self.set_status(f"已重载 '{name}'" if started
+                                else f"已重载 '{name}'，但 Claude 没启动起来，请从开始菜单手动打开")
                 self._refresh_profiles()
             self.after(0, finish)
 
@@ -2157,8 +2869,12 @@ class App(ctk.CTk):
         """清空会话文件，让 Claude 启动后显示登录页"""
         if self.is_switching:
             return
+        storage_error = self.pm.session_storage_error()
+        if storage_error:
+            self.set_status(storage_error)
+            return
         dialog = ConfirmDialog(self, "登录新账号",
-                               "将保存当前会话并清空登录状态，\nClaude 重启后请登录新账号。",
+                               "将保存当前会话并清空登录状态，\nClaude 会被强制关闭再重启，重启后请登录新账号。",
                                confirm_text="继续")
         if not dialog.get_result():
             return
@@ -2169,8 +2885,22 @@ class App(ctk.CTk):
 
         def do_new_login():
             current = self.pm.get_current()
-            self.after(0, self.set_status, "正在关闭 Claude...")
-            self.pm.stop_claude()
+            if not current or not (INSTANCE_DIR / current / "config.json").exists():
+                def no_backup():
+                    self.is_switching = False
+                    self.create_btn.configure(state="normal")
+                    self.new_login_btn.configure(state="normal")
+                    self.set_status("请先保存当前登录为 Profile，再登录其他账号")
+                self.after(0, no_backup)
+                return
+            if not self.pm.stop_claude():
+                def blocked():
+                    self.is_switching = False
+                    self.create_btn.configure(state="normal")
+                    self.new_login_btn.configure(state="normal")
+                    self.set_status("Claude 没能退出，原会话未改动；请在任务管理器结束 Claude 后重试")
+                self.after(0, blocked)
+                return
             time.sleep(1)
             if current:
                 self.after(0, self.set_status, "保存当前会话...")
@@ -2186,12 +2916,13 @@ class App(ctk.CTk):
                     shutil.rmtree(p)
             self.pm.set_current("")
             self.after(0, self.set_status, "启动 Claude...")
-            self.pm.start_claude()
+            started = self.pm.start_claude()
             def finish():
                 self.is_switching = False
                 self.create_btn.configure(state="normal")
                 self.new_login_btn.configure(state="normal")
-                self.set_status("请登录新账号，然后点「保存当前登录为新 Profile」")
+                self.set_status("请登录新账号，然后点「保存当前登录为新 Profile」" if started
+                                else "Claude 没启动起来，请从开始菜单手动打开并登录新账号")
                 self._refresh_profiles()
             self.after(0, finish)
 
@@ -2209,7 +2940,7 @@ class App(ctk.CTk):
             self.set_status("名称不能包含特殊字符")
             return
 
-        note_dialog = ctk.CTkInputDialog(text="备注（可选，如邮箱/密码/令牌等）：",
+        note_dialog = ctk.CTkInputDialog(text="备注（可选，如邮箱；不要填写密码或令牌）：",
                                           title="Profile 备注")
         note = note_dialog.get_input() or ""
 
@@ -2365,21 +3096,10 @@ class App(ctk.CTk):
         if self.is_switching:
             return
         self.is_switching = True
+        self._last_manual_switch_at = time.time()
 
         def do_switch():
-            success, msg = self.pm.switch_profile(name,
-                progress_cb=lambda t: self.after(0, self.set_status, t),
-                on_old_usage_fetched=self._cache_usage)
-
-            # 顺便刷新新账号
-            if success:
-                try:
-                    new_info = UsageFetcher.get_account_info()
-                    new_token = new_info.get('token')
-                    if new_token:
-                        self._cache_usage(name, UsageFetcher.fetch_usage(new_token))
-                except Exception:
-                    pass
+            success, msg = self._switch_and_record(name, "托盘")
 
             def finish():
                 self.is_switching = False

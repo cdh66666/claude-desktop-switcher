@@ -8,10 +8,11 @@ a = Analysis(
     pathex=[],
     binaries=[],
     # 资源文件：保留 assets/ 子目录结构
-    datas=[('assets/claude-icon.ico', 'assets')],
+    datas=[('assets/claude-icon.ico', 'assets'), ('auto_continue.ps1', '.')],
     hiddenimports=[
         'pystray._win32',
         'PIL._tkinter_finder',
+        'auto_switch',
     ],
     hookspath=[],
     hooksconfig={},
