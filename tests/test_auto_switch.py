@@ -49,6 +49,13 @@ class PickTarget(unittest.TestCase):
         cache = {"1": u(100), "2": u(0, w=100), "3": u(100, rate_limited=True), "4": u(95)}
         self.assertEqual(self.pick(cache)[0], "4")
 
+    def test_weekly_almost_full_skipped(self):
+        # 周额度 95% 也当用完；94% 还能选
+        cache = {"1": u(100), "2": u(0, w=95), "3": u(0, w=94)}
+        self.assertEqual(self.pick(cache)[0], "3")
+        cache = {"1": u(100), "2": u(0, w=97)}
+        self.assertIsNone(self.pick(cache)[0])
+
     def test_weekly_reset_passed_not_skipped(self):
         cache = {"1": u(100), "2": u(0, w=100, w_reset=NOW - 5)}
         self.assertEqual(self.pick(cache)[0], "2")

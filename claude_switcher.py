@@ -630,7 +630,8 @@ class ProfileManager:
 
     # 自动“继续”的设置（改 ~/.claude-instances/_settings.json；folder 留空 = 不限文件夹）
     SETTINGS_FILE = INSTANCE_DIR / "_settings.json"
-    DEFAULT_SETTINGS = {"auto_continue": True, "folder": "",
+    # 自动发“继续”默认关：自动接着跑会很快花光额度，要用自己在界面上勾
+    DEFAULT_SETTINGS = {"auto_continue": False, "folder": "",
                         "text": "继续", "session_title": "总控"}
 
     def get_settings(self) -> dict:
